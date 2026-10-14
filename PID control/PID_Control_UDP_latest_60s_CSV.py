@@ -10,6 +10,7 @@ import re
 import csv
 from datetime import datetime
 from pathlib import Path
+from bisect import bisect_left
 
 ports = serial.tools.list_ports.comports()
 
@@ -143,7 +144,7 @@ kd = 0.1
 dt = 0
 
 # Setpoint 설정
-setpoint = 200
+setpoint = 175
 
 pid = PIDController(kp, ki, kd, dt)
 #%%
@@ -178,8 +179,8 @@ line_set, = ax1.plot([], [], 'r--', label='Setpoint (목표값)')
 ax1.set_title('PID Temperature Control')
 ax1.set_xlabel('Time [s]')
 ax1.set_ylabel('Temperature [C]')
-ax1.set_xlim(0, 10)
-ax1.set_ylim(0, 250)
+ax1.set_xlim(0, 60)
+ax1.set_ylim(40, 300)
 ax1.legend()
 ax1.grid(True)
 
@@ -191,10 +192,13 @@ line_duty, = ax2.plot([], [], 'g-', label='Duty Cycle')
 ax2.set_title('Duty Cycle vs Time')
 ax2.set_xlabel('Time [s]')
 ax2.set_ylabel('Duty Cycle [%]')
-ax2.set_xlim(0, 10)
+ax2.set_xlim(0, 60)
 ax2.set_ylim(0, 105)
 ax2.legend()
 ax2.grid(True)
+
+# X축에는 최근 60초만 표시 (원본 데이터는 모두 유지)
+GRAPH_WINDOW_SECONDS = 60.0
 
 # ================================
 # START / STOP 버튼 추가
@@ -325,34 +329,30 @@ try:
 
         if now - last_plot_time >= 0.5:
 
-            # 그래프 표시 데이터만 줄임
-            # 원본 데이터는 모두 저장됨
-            step = max(1, (len(time_history) + 1499) // 1500)
+            # 최근 60초 구간만 그래프에 표시
+            # 60초 이후에는 표시 데이터가 왼쪽으로 이동하며,
+            # CSV용 원본 데이터는 전부 그대로 유지됨
+            window_start = max(0.0, elapsed_time - GRAPH_WINDOW_SECONDS)
+            start_idx = bisect_left(time_history, window_start)
+            window_count = len(time_history) - start_idx
+            step = max(1, (window_count + 1499) // 1500)
+
+            plot_time = [t - window_start for t in time_history[start_idx::step]]
 
             line_temp.set_data(
-                time_history[::step],
-                temp_history[::step]
+                plot_time,
+                temp_history[start_idx::step]
             )
 
             line_set.set_data(
-                time_history[::step],
-                set_point[::step]
+                plot_time,
+                set_point[start_idx::step]
             )
 
             line_duty.set_data(
-                time_history[::step],
-                pid_gain[::step]
+                plot_time,
+                pid_gain[start_idx::step]
             )
-
-            # 시간축 10초 단위로 자동 확장
-            xmax = max(
-                10,
-                np.ceil((elapsed_time + 1) / 10) * 10
-            )
-
-            if xmax > ax1.get_xlim()[1]:
-                ax1.set_xlim(0, xmax)
-                ax2.set_xlim(0, xmax)
 
             fig1.canvas.draw_idle()
 
@@ -387,23 +387,28 @@ finally:
         pass
 
 #%%
-# 마지막 그래프 반영
+# 마지막 그래프도 최근 60초만 표시
 if len(time_history) > 0:
-    step = max(1, (len(time_history) + 1499) // 1500)
+    window_start = max(0.0, time_history[-1] - GRAPH_WINDOW_SECONDS)
+    start_idx = bisect_left(time_history, window_start)
+    window_count = len(time_history) - start_idx
+    step = max(1, (window_count + 1499) // 1500)
+
+    plot_time = [t - window_start for t in time_history[start_idx::step]]
 
     line_temp.set_data(
-        time_history[::step],
-        temp_history[::step]
+        plot_time,
+        temp_history[start_idx::step]
     )
 
     line_set.set_data(
-        time_history[::step],
-        set_point[::step]
+        plot_time,
+        set_point[start_idx::step]
     )
 
     line_duty.set_data(
-        time_history[::step],
-        pid_gain[::step]
+        plot_time,
+        pid_gain[start_idx::step]
     )
 
 fig1.canvas.draw_idle()
