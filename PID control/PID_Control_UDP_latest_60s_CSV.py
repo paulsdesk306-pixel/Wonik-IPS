@@ -137,14 +137,14 @@ pid_gain = []
 set_point = []
 
 # PI 이득(Gain) 설정
-kp = 3.0
-ki = 0.02
-kd = 0.1
+kp = 5.0
+ki = 2.0
+kd = 1.0
 # dt 설정
 dt = 0
 
 # Setpoint 설정
-setpoint = 175
+setpoint = 200
 
 pid = PIDController(kp, ki, kd, dt)
 #%%
