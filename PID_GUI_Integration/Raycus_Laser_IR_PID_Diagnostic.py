@@ -6,6 +6,7 @@
 #   Unified controls, direct Duty Cycle entry, fast persistent UDP polling, and IR monitoring.
 # - Optical power display is calculated from the RCS power setpoint using a 3 kW rated maximum.
 
+import csv
 import json
 import math
 import numpy as np
@@ -13,12 +14,13 @@ import os
 import re
 import socket
 import threading
+import tempfile
 import time
 import tkinter as tk
 from collections import deque
 from datetime import datetime
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 try:
     import serial
@@ -64,6 +66,20 @@ IR_PLOT_WINDOW_SECONDS = 60.0
 IR_PLOT_REFRESH_MS = 200
 IR_HISTORY_MAXLEN = 4000
 
+# ============================================================
+# Wafer IR temperature PID (software supervisor; not a safety interlock)
+# ============================================================
+PID_INTERVAL_S = 1.0           # nominal control cadence
+PID_SENSOR_MAX_AGE_S = 1.8     # stale selected IR -> stop and EMOFF
+PID_COMMAND_TIMEOUT_MS = 250
+PID_DUTY_MIN = 3.0             # confirm Raycus device limits before use
+PID_DUTY_MAX = 100.0
+PID_OVERSHOOT_MARGIN_C = 20.0 # provisional process guard, NOT safety-rated
+PID_ABSOLUTE_CUTOFF_C = 265.0 # provisional process guard, NOT safety-rated
+PID_MIN_SETPOINT_C = 30.0
+PID_MAX_SETPOINT_C = 250.0
+PID_HISTORY_MAXLEN = 4000
+
 # IR 자동 검색/재연결. 0.10 s는 일부 USB-Serial에서 탐색 시 너무 짧을 수 있어
 # 실제 센서 탐색은 최대 0.30 s, 3회 재시도한다.
 IR_PROBE_TIMEOUT = 0.30
@@ -71,6 +87,13 @@ IR_PROBE_ATTEMPTS = 3
 IR_OPEN_SETTLE = 0.15
 IR_SCAN_INTERVAL = 2.0
 IR_RECONNECT_DELAY = 0.5
+
+# When heating is evident, the warmer IR sensor is the wafer-center sensor.
+# Confirm continuously to avoid swapping because of a brief fluctuation.
+IR_AUTO_ROLE_MIN_HOT_C = 40.0
+IR_AUTO_ROLE_MIN_DIFF_C = 5.0
+IR_AUTO_ROLE_CONFIRM_S = 1.5
+IR_AUTO_ROLE_FRESH_S = 0.8
 
 # 현재 확인된 배선에서 첫 자동 학습 시 사용할 힌트.
 # 사용자가 알려준 현재 상태: COM5 쪽이 Outside, COM8 쪽이 Wafer.
@@ -96,6 +119,9 @@ TC_WRITE_TIMEOUT = 0.02
 TC_CHANNEL_COUNT = 20
 TC_PLOT_WINDOW_SECONDS = 60.0
 TC_PLOT_REFRESH_MS = 200
+TC_HEATMAP_REFRESH_MS = 300
+TC_DATA_PROCESS_MS = 50
+TC_RENDER_MAX_POINTS = 450
 TC_HISTORY_MAXLEN = 12000
 
 # TC wafer-layout mapping borrowed from the supplied v8.2 logger.
@@ -120,7 +146,7 @@ def _generate_tc_wafer_coords():
     return coords
 
 TC_SENSOR_COORDS = _generate_tc_wafer_coords()
-TC_HEATMAP_GRID = 120
+TC_HEATMAP_GRID = 100
 
 # One command per polling tick. A full cycle therefore takes
 # len(POLL_COMMANDS) * Reads[ms].
@@ -347,19 +373,22 @@ def set_frequency(value):
     value = str(value).strip()
     if not value:
         raise ValueError("Frequency 값을 입력하세요.")
-    float(value)
+    frequency = float(value)
+    if frequency <= 0.0:
+        raise ValueError("Frequency는 0보다 커야 합니다.")
+
+    # 단독 Rep Rate 변경이 현재 Pulse Width와 충돌하면 현재 Duty를 유지하며 함께 변경.
+    current_frequency = response_number(udp_command("RPRR"), "RPRR")
+    current_pulse_ms = response_number(udp_command("RPW"), "RPW")
+    if current_pulse_ms * frequency / 10.0 > 100.0:
+        current_duty = current_pulse_ms * current_frequency / 10.0
+        return set_duty_cycle(current_duty, frequency)
+
     return udp_command(f"SPRR {value}")
 
 
 def set_duty_cycle(duty_value, frequency_hz):
-    """Set Duty Cycle from the user-facing percentage field.
-
-    The Raycus ASCII command table supplied with this project has no standalone
-    "set duty" command. The device exposes SPRR (frequency) and SPW (pulse width).
-    Therefore the GUI accepts Duty Cycle directly, while this helper performs the
-    protocol-required SPW conversion internally and immediately verifies the
-    result with RPRR/RPW readback. Pulse width is never exposed as a user input.
-    """
+    """Set Duty Cycle via SPRR/SPW while avoiding invalid intermediate Duty."""
     duty = float(str(duty_value).strip())
     frequency = float(str(frequency_hz).strip())
     if not (0.0 <= duty <= 100.0):
@@ -370,15 +399,26 @@ def set_duty_cycle(duty_value, frequency_hz):
     # period_ms = 1000 / Hz; pulse_ms = period_ms * duty/100
     pulse_ms = duty * 10.0 / frequency
 
-    # Always set frequency immediately before SPW. This prevents the laser from
-    # evaluating SPW against an old repetition rate and returning a stale Duty.
-    freq_ack = udp_command(f"SPRR {frequency:g}")
-    if not freq_ack.get("ok"):
-        return freq_ack
+    # 높아지는 Rep Rate에서 기존 Pulse Width 때문에 Duty > 100%가 되는 문제 방지.
+    # 반대로 Rep Rate가 낮아질 때는 주파수를 먼저 줄여 PW 증가 시 과도한 Duty를 피함.
+    current_frequency = response_number(udp_command("RPRR"), "RPRR")
+    pw_command = f"SPW {pulse_ms:.6f}"
+    freq_command = f"SPRR {frequency:g}"
 
-    pw_ack = udp_command(f"SPW {pulse_ms:.6f}")
-    if not pw_ack.get("ok"):
-        return pw_ack
+    if frequency > current_frequency:
+        command_order = (pw_command, freq_command)
+    else:
+        command_order = (freq_command, pw_command)
+
+    acknowledgements = {}
+    for command in command_order:
+        ack = udp_command(command)
+        if not ack.get("ok"):
+            return ack
+        acknowledgements[command.split()[0]] = ack
+
+    freq_ack = acknowledgements["SPRR"]
+    pw_ack = acknowledgements["SPW"]
 
     verified_frequency = None
     verified_pulse_ms = None
@@ -410,9 +450,9 @@ def set_duty_cycle(duty_value, frequency_hz):
         "ok": True,
         "result": pw_ack.get("result", ""),
         "command": f"DUTY {duty:g}",
-        "tx_ascii": f"SPRR {frequency:g}\\r  ->  SPW {pulse_ms:.6f}\\r",
+        "tx_ascii": "  ->  ".join(command + r"\r" for command in command_order),
         "tx_hex": "(two UDP commands)",
-        "rx_ascii": f"{freq_ack.get('rx_ascii', '')} | {pw_ack.get('rx_ascii', '')}",
+        "rx_ascii": " | ".join(acknowledgements[command.split()[0]].get("rx_ascii", "") for command in command_order),
         "rx_hex": "-",
         "header": pw_ack.get("header", f"UDP {raycus.ip}:{raycus.port}"),
         "local_address": local,
@@ -1045,7 +1085,8 @@ class IRSerialWorker:
                     if frame is not None:
                         bad_count = 0
                         raw_temp = int.from_bytes(frame[3:5], byteorder="big", signed=True)
-                        self.temp_callback(self.channel, raw_temp / 10.0)
+                        # Preserve monitoring fallback, but PID accepts CRC-verified samples only.
+                        self.temp_callback(self.channel, raw_temp / 10.0, crc_ok)
                     else:
                         bad_count += 1
                         if bad_count >= 10:
@@ -1083,10 +1124,11 @@ class IRSerialWorker:
 
 class IRSensorManager:
     """Discover current COM ports, learn USB identity, and reconnect automatically."""
-    def __init__(self, temp_callback, log_callback, assignment_callback):
+    def __init__(self, temp_callback, log_callback, assignment_callback, role_swap_callback=None):
         self.temp_callback = temp_callback
         self.log_callback = log_callback
         self.assignment_callback = assignment_callback
+        self.role_swap_callback = role_swap_callback
         self.stop_event = threading.Event()
         self.thread = None
         self.workers = [None, None]
@@ -1096,6 +1138,63 @@ class IRSensorManager:
         self.rescan_event = threading.Event()
         self._scan_no = 0
         self._last_diag_signature = None
+        self._temperature_lock = threading.Lock()
+        self._reset_heat_role_detection()
+
+    def _reset_heat_role_detection(self):
+        with self._temperature_lock:
+            self._last_ir_temp = [None, None]
+            self._last_ir_time = [0.0, 0.0]
+            self._hot_candidate = None
+            self._hot_candidate_since = None
+            self._role_confirmed = False
+            self._auto_swap_pending = False
+
+    def _on_temperature(self, channel, temperature, crc_ok=True):
+        """Only CRC-verified samples qualify for PID or sensor role auto-learning."""
+        if not crc_ok:
+            self.temp_callback(channel, temperature, False)
+            return
+        confirmed = None
+        now = time.monotonic()
+        with self._temperature_lock:
+            if math.isfinite(temperature):
+                self._last_ir_temp[channel] = temperature
+                self._last_ir_time[channel] = now
+
+            if not self._role_confirmed and not self._auto_swap_pending:
+                t0, t1 = self._last_ir_temp
+                fresh = all(now - ts <= IR_AUTO_ROLE_FRESH_S for ts in self._last_ir_time)
+                if (fresh and t0 is not None and t1 is not None
+                        and max(t0, t1) >= IR_AUTO_ROLE_MIN_HOT_C
+                        and abs(t0 - t1) >= IR_AUTO_ROLE_MIN_DIFF_C):
+                    hotter = 0 if t0 > t1 else 1
+                    if hotter != self._hot_candidate:
+                        self._hot_candidate = hotter
+                        self._hot_candidate_since = now
+                    elif now - self._hot_candidate_since >= IR_AUTO_ROLE_CONFIRM_S:
+                        self._role_confirmed = True
+                        confirmed = (hotter, t0, t1)
+                        if hotter == 1:  # The Outside-assigned port is physically at the center.
+                            self._auto_swap_pending = True
+                else:
+                    self._hot_candidate = None
+                    self._hot_candidate_since = None
+
+        self.temp_callback(channel, temperature, True)
+        if confirmed is not None:
+            hotter, wafer_temp, outside_temp = confirmed
+            if hotter == 1:
+                self.log_callback(
+                    f"[IR 온도 자동판별] 중심부/Outside가 반대입니다: "
+                    f"Wafer={wafer_temp:.1f} °C, Outside={outside_temp:.1f} °C. 자동 교환합니다."
+                )
+                self.rescan_event.set()
+            else:
+                self.log_callback(
+                    f"[IR 온도 자동판별] 현재 매핑 확인 완료: "
+                    f"Wafer={wafer_temp:.1f} °C, Outside={outside_temp:.1f} °C."
+                )
 
     def start(self):
         if self.thread and self.thread.is_alive():
@@ -1117,20 +1216,25 @@ class IRSensorManager:
         self.assignment_callback(channel, None, None)
 
     def _cleanup_dead_workers(self):
+        lost_worker = False
         for channel in range(2):
             worker = self.workers[channel]
             if worker is not None and not worker.is_alive():
                 self._stop_channel(channel)
+                lost_worker = True
+        if lost_worker:
+            self._reset_heat_role_detection()
 
     def request_rescan(self):
         with self._lock:
             for channel in range(2):
                 self._stop_channel(channel)
+            self._reset_heat_role_detection()
         self._last_diag_signature = None
         self.rescan_event.set()
         self.log_callback("[IR] 강제 재검색 요청")
 
-    def swap_roles(self):
+    def swap_roles(self, automatic=False):
         """Swap saved identities AND live channels, then reconnect."""
         with self._lock:
             a = self.mapping.get(IR_SENSOR_NAMES[0])
@@ -1140,8 +1244,15 @@ class IRSensorManager:
             save_ir_mapping(self.mapping)
             for channel in range(2):
                 self._stop_channel(channel)
+            # Do not swap back during cooldown or because of one noisy sample.
+            self._reset_heat_role_detection()
+            with self._temperature_lock:
+                self._role_confirmed = True
+        if self.role_swap_callback is not None:
+            self.role_swap_callback()
         self.rescan_event.set()
-        self.log_callback("[IR] Wafer / Outside 역할을 교환하고 identity 매핑을 저장했습니다.")
+        prefix = "[IR 온도 자동교정]" if automatic else "[IR]"
+        self.log_callback(f"{prefix} Wafer / Outside 역할을 교환하고 identity 매핑을 저장했습니다.")
 
     def clear_mapping(self):
         with self._lock:
@@ -1149,6 +1260,7 @@ class IRSensorManager:
             save_ir_mapping(self.mapping)
             for channel in range(2):
                 self._stop_channel(channel)
+            self._reset_heat_role_detection()
         self._last_diag_signature = None
         self.rescan_event.set()
         self.log_callback("[IR] 저장된 identity 매핑 초기화 -> 현재 COM 전체 재검색")
@@ -1178,6 +1290,11 @@ class IRSensorManager:
         )
 
         while not self.stop_event.is_set():
+            with self._temperature_lock:
+                do_auto_swap = self._auto_swap_pending
+            if do_auto_swap:
+                # Execute on the manager thread, never from a serial worker.
+                self.swap_roles(automatic=True)
             with self._lock:
                 self._cleanup_dead_workers()
                 missing = [i for i, worker in enumerate(self.workers) if worker is None]
@@ -1229,7 +1346,7 @@ class IRSensorManager:
                             port=sensor["device"],
                             slave_id=IR_SLAVE_ID,
                             sensor_name=role,
-                            temp_callback=self.temp_callback,
+                            temp_callback=self._on_temperature,
                             log_callback=self.log_callback,
                         )
                         self.workers[channel] = worker
@@ -1422,6 +1539,343 @@ class TC20CHWorker:
 
 
 # ============================================================
+# PID controller - runs independent of GUI/plot refresh, with fresh IR checks
+# ============================================================
+class DutyPID:
+    """Anti-windup PID, derivative on PV to avoid setpoint kick."""
+
+    def __init__(self, kp, ki, kd):
+        self.kp, self.ki, self.kd = float(kp), float(ki), float(kd)
+        self.integral = 0.0
+        self.previous_pv = None
+
+    def reset(self, pv):
+        self.integral = 0.0
+        self.previous_pv = float(pv)
+
+    def calculate(self, target, pv, dt, integrate=True):
+        if not math.isfinite(dt) or dt <= 0:
+            raise ValueError("PID dt must be positive")
+        error = target - pv
+        p_term = self.kp * error
+        d_term = (-(pv - self.previous_pv) / dt * self.kd
+                  if self.previous_pv is not None else 0.0)
+        candidate_i = self.integral + error * dt if integrate else self.integral
+        candidate = p_term + self.ki * candidate_i + d_term
+        # Freeze integration only when it would drive the output further into saturation.
+        if integrate and not ((candidate > PID_DUTY_MAX and error > 0)
+                              or (candidate < PID_DUTY_MIN and error < 0)):
+            self.integral = candidate_i
+        raw = p_term + self.ki * self.integral + d_term
+        self.previous_pv = float(pv)
+        return {
+            "error": error, "p": p_term, "i": self.ki * self.integral,
+            "d": d_term, "raw_duty": raw,
+            "duty": min(PID_DUTY_MAX, max(PID_DUTY_MIN, raw)),
+        }
+
+
+class TemperaturePIDSupervisor:
+    """PID worker owns EMON/EMOFF during a control session.
+
+    A software supervisor is not a replacement for a physical emergency stop,
+    hardware temperature limit, laser interlock, or independent watchdog.
+    """
+
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.samples = [(None, 0.0), (None, 0.0)]
+        self.state = "IDLE"
+        self.thread = None
+        self.stop_event = threading.Event()
+        self.stop_reason = ""
+        self.emission_may_be_on = False
+
+    def on_sample(self, channel, temperature):
+        with self.lock:
+            if channel in (0, 1):
+                value = float(temperature)
+                if math.isfinite(value):
+                    self.samples[channel] = (value, time.monotonic())
+
+    def sensor_lost(self, channel, reason="IR sensor disconnected/remapped"):
+        with self.lock:
+            if channel in (0, 1):
+                self.samples[channel] = (None, 0.0)
+            should_stop = self.state in ("STARTING", "RUNNING")
+        if should_stop:
+            self.request_stop(reason)
+
+    def is_active(self):
+        with self.lock:
+            return self.state in ("STARTING", "RUNNING", "STOPPING")
+
+    def request_stop(self, reason="Operator STOP"):
+        with self.lock:
+            if self.state not in ("STARTING", "RUNNING", "STOPPING"):
+                return False
+            self.stop_reason = reason
+            self.stop_event.set()
+            self.state = "STOPPING"
+        self._post_status("STOPPING", reason)
+        return True
+
+    def _post_status(self, state, details=""):
+        try:
+            if root is not None:
+                root.after(0, lambda: pid_status_from_worker(state, details))
+        except (RuntimeError, tk.TclError):
+            pass
+
+    def _post_record(self, record):
+        try:
+            if root is not None:
+                root.after(0, lambda: pid_record_from_worker(record))
+        except (RuntimeError, tk.TclError):
+            pass
+
+    def _read_sample(self, channel):
+        with self.lock:
+            temp, timestamp = self.samples[channel]
+        if temp is None or time.monotonic() - timestamp > PID_SENSOR_MAX_AGE_S:
+            raise RuntimeError(f"Selected IR {IR_SENSOR_NAMES[channel]} stale/missing: "
+                               f"last age={time.monotonic() - timestamp:.2f}s")
+        return temp
+
+    def _check_guard(self, target):
+        cutoff = min(PID_ABSOLUTE_CUTOFF_C, target + PID_OVERSHOOT_MARGIN_C)
+        now = time.monotonic()
+        with self.lock:
+            samples = list(self.samples)
+        for channel, (temperature, stamp) in enumerate(samples):
+            if temperature is not None and now - stamp <= PID_SENSOR_MAX_AGE_S:
+                if temperature >= cutoff:
+                    raise RuntimeError(
+                        f"OVER-TEMPERATURE: {IR_SENSOR_NAMES[channel]}={temperature:.1f}°C "
+                        f">= software cutoff {cutoff:.1f}°C"
+                    )
+
+    def _command(self, command):
+        result = raycus.command(command, timeout_ms=PID_COMMAND_TIMEOUT_MS)
+        if not result.get("ok"):
+            raise RuntimeError(f"Raycus rejected {command}: {result.get('result')}")
+        return result
+
+    def _send_duty(self, duty, frequency):
+        # During PID only SPW is updated; SPRR is fixed at its verified start value.
+        # This avoids 2+ unnecessary control messages on each PID interval.
+        pulse_ms = duty * 10.0 / frequency
+        self._command(f"SPW {pulse_ms:.6f}")
+
+    def start(self, settings):
+        channel = settings["channel"]
+        if not raycus.is_open:
+            raise RuntimeError("Raycus UDP Connect가 필요합니다.")
+        if manual_command_pending.is_set():
+            raise RuntimeError("다른 수동 명령이 수행 중입니다. 완료 후 START 하세요.")
+        with self.lock:
+            if self.state == "FAULT":
+                raise RuntimeError("이전 PID FAULT가 해제되지 않았습니다. 출력 OFF를 확인하고 RESET 하세요.")
+            if self.state != "IDLE" or (self.thread and self.thread.is_alive()):
+                raise RuntimeError("PID가 이미 실행 중이거나 종료 처리 중입니다.")
+            self._read_sample(channel)
+            self._check_guard(settings["target"])
+            self.stop_event.clear()
+            self.stop_reason = ""
+            self.state = "STARTING"
+            self.thread = threading.Thread(target=self._run, args=(dict(settings),),
+                                           name="Wafer-IR-PID", daemon=True)
+            worker = self.thread
+        self._post_status("STARTING", "Raycus preflight checks")
+        worker.start()
+
+    def _run(self, settings):
+        channel = settings["channel"]
+        target = settings["target"]
+        pid_core = DutyPID(settings["kp"], settings["ki"], settings["kd"])
+        error = None
+        off_ok = False
+        manual_command_pending.set()
+        try:
+            self._read_sample(channel)
+            self._check_guard(target)
+            sta = response_word(self._command("STA"), "STA")
+            if bit(sta, 7) or bit(sta, 24) or bit(sta, 29):
+                raise RuntimeError(f"STA alarm/critical fault: 0x{sta:08X}")
+            if not bit(sta, 18):
+                raise RuntimeError("STA READY bit is OFF. PID emission will not start.")
+            if bit(sta, 2):
+                raise RuntimeError("Laser emission already ON. Turn it OFF before PID START.")
+            # The GUI Power entry is NOT applied by PID START. Validate actual device readback.
+            # Never auto-increase power or alter gate/interlock/external-control mode.
+            power_response = self._command("RCS")
+            power_percent = response_number(power_response, "RCS")
+            if not math.isfinite(power_percent) or power_percent < 0 or power_percent > 100:
+                raise RuntimeError(f"Invalid RCS power readback: {power_percent}")
+            if power_percent <= 0.0:
+                raise RuntimeError(
+                    "RCS=0% (actual laser power setting). PID START cancelled: "
+                    "GUI Power input is not automatically applied. "
+                    "Review laser manual/interlock and independently configure Power before restarting."
+                )
+            frequency = response_number(self._command("RPRR"), "RPRR")
+            if not math.isfinite(frequency) or frequency <= 0:
+                raise RuntimeError(f"Invalid RPRR frequency: {frequency}")
+            self._post_status(
+                "STARTING",
+                f"Device readback: RCS={power_percent:g}%, RPRR={frequency:g}Hz, "
+                f"STA=0x{sta:08X} (Gate={bit(sta, 16)}, Mod={bit(sta, 12)}, "
+                f"External={bit(sta, 17)}); these are not optical power measurements"
+            )
+            if self.stop_event.is_set():
+                return
+            pv = self._read_sample(channel)
+            self._check_guard(target)
+            pid_core.reset(pv)
+            first = pid_core.calculate(target, pv, PID_INTERVAL_S, integrate=False)
+            self._send_duty(first["duty"], frequency)
+            if self.stop_event.is_set():
+                return
+            # Explicit PID START was confirmed in the GUI; no auto emission at program launch.
+            self.emission_may_be_on = True
+            self._command("EMON")
+            # ACK is NOT proof of optical output. Verify laser-enable status immediately.
+            if self.stop_event.wait(0.15):
+                return
+            sta_after = response_word(self._command("STA"), "STA")
+            if bit(sta_after, 7) or bit(sta_after, 24) or bit(sta_after, 29):
+                raise RuntimeError(f"EMON ACK, but STA alarm/fault: 0x{sta_after:08X}")
+            if not bit(sta_after, 2):
+                raise RuntimeError(
+                    f"EMON ACK but STA Laser enabled=0: 0x{sta_after:08X}; "
+                    f"Gate={bit(sta_after, 16)}, Mod={bit(sta_after, 12)}, "
+                    f"External={bit(sta_after, 17)}, READY={bit(sta_after, 18)}. "
+                    "Check device interlocks, control mode and required external inputs."
+                )
+            with self.lock:
+                if not self.stop_event.is_set():
+                    self.state = "RUNNING"
+            self._post_status(
+                "RUNNING", f"{IR_SENSOR_NAMES[channel]} / {frequency:g} Hz / "
+                f"RCS={power_percent:g}% / STA Enable=1 (optical output NOT verified)"
+            )
+            started = time.monotonic()
+            previous = started
+            next_tick = started
+            sample_no = 0
+            while not self.stop_event.is_set():
+                if self.stop_event.wait(max(0.0, next_tick - time.monotonic())):
+                    break
+                now = time.monotonic()
+                dt = now - previous
+                if sample_no == 0:
+                    dt = PID_INTERVAL_S
+                elif dt > PID_INTERVAL_S * 3.0:
+                    raise RuntimeError(f"PID loop delayed: dt={dt:.2f}s")
+                previous = now
+                pv = self._read_sample(channel)
+                self._check_guard(target)
+                terms = pid_core.calculate(target, pv, dt)
+                # A low duty at/above setpoint cannot cool the wafer; shut off on deviation.
+                if pv > target + 5.0 and terms["raw_duty"] < PID_DUTY_MIN:
+                    raise RuntimeError("PID requested below-minimum duty above target; EMOFF for cooling")
+                if self.stop_event.is_set():
+                    break
+                self._send_duty(terms["duty"], frequency)
+                if sample_no > 0 and sample_no % 5 == 0:
+                    verified_freq = response_number(self._command("RPRR"), "RPRR")
+                    if abs(verified_freq - frequency) > max(1.0, frequency * 0.001):
+                        raise RuntimeError("RPRR changed externally during PID")
+                    status = response_word(self._command("STA"), "STA")
+                    if bit(status, 7) or bit(status, 24) or bit(status, 29) or not bit(status, 2):
+                        raise RuntimeError("Laser STA fault/emission OFF during PID")
+                record = {
+                    "timestamp": _export_timestamp(),
+                    "elapsed": time.monotonic() - ir_start_time,
+                    "channel": channel,
+                    "pv": pv, "target": target,
+                    "kp": settings["kp"], "ki": settings["ki"], "kd": settings["kd"],
+                    "frequency": frequency, "dt": dt,
+                    **terms,
+                }
+                self._post_record(record)
+                sample_no += 1
+                next_tick += PID_INTERVAL_S
+                if next_tick < time.monotonic():
+                    next_tick = time.monotonic() + PID_INTERVAL_S
+        except Exception as exc:
+            error = str(exc)
+        finally:
+            # Stop path always issues EMOFF if we may have enabled emission.
+            # Preflight rejection of an already-emitting laser never assumes ownership.
+            controlled_emission = self.emission_may_be_on
+            if controlled_emission:
+                for _ in range(2):
+                    try:
+                        self._command("EMOFF")
+                        off_ok = True
+                        break
+                    except Exception as exc:
+                        error = (error + "; " if error else "") + f"EMOFF failed: {exc}"
+            else:
+                off_ok = True
+            self.emission_may_be_on = not off_ok
+            with self.lock:
+                reason = self.stop_reason
+                self.state = "FAULT" if not off_ok else "IDLE"
+            manual_command_pending.clear()
+            # Always show the terminal duty at 0 only if device ACKed OFF.
+            self._post_record({"timestamp": _export_timestamp(),
+                               "elapsed": time.monotonic() - ir_start_time,
+                               "channel": channel, "pv": None, "target": target,
+                               "kp": settings["kp"], "ki": settings["ki"], "kd": settings["kd"],
+                               "frequency": None, "dt": None, "error": None,
+                               "p": None, "i": None, "d": None,
+                               "raw_duty": None,
+                               "duty": 0.0 if controlled_emission and off_ok else None})
+            if not off_ok:
+                self._post_status("FAULT", f"OUTPUT OFF NOT CONFIRMED! {error or reason}")
+            elif not controlled_emission:
+                # No EMOFF was sent, since PID had not issued EMON. Never imply OFF ACK.
+                self._post_status("START_REJECTED" if error else "IDLE",
+                                  f"PID did not issue EMON / EMOFF. {error or reason}")
+            elif error:
+                self._post_status("FAULT_STOPPED", f"EMOFF ACK OK. {error}")
+            else:
+                self._post_status("IDLE", reason or "PID stopped; EMOFF ACK OK")
+
+    def reset_fault(self):
+        """Allows a restart only after we can verify device emission is off."""
+        if self.is_active():
+            raise RuntimeError("PID STOP을 먼저 누르세요.")
+        if self.thread and self.thread.is_alive():
+            raise RuntimeError("이전 PID worker 종료 중입니다.")
+        sta = response_word(self._command("STA"), "STA")
+        if bit(sta, 2) or bit(sta, 7) or bit(sta, 24) or bit(sta, 29):
+            raise RuntimeError("Laser still emitting or STA alarm; cannot RESET")
+        with self.lock:
+            self.state = "IDLE"
+            self.emission_may_be_on = False
+        self._post_status("IDLE", "STA confirms emission OFF; fault reset")
+
+    def close(self):
+        self.request_stop("Application closing")
+        thread = self.thread
+        if thread and thread.is_alive():
+            thread.join(timeout=3.0)
+        # If worker is blocked or failed before EMOFF, best-effort further attempt.
+        if self.emission_may_be_on:
+            try:
+                self._command("EMOFF")
+                self.emission_may_be_on = False
+            except Exception:
+                pass
+
+
+pid_supervisor = TemperaturePIDSupervisor()
+
+
+# ============================================================
 # GUI state
 # ============================================================
 root = None
@@ -1472,10 +1926,18 @@ tc_plot_lines = []
 tc_plot_canvas = None
 tc_map_axis = None
 tc_map_canvas = None
-tc_map_mesh = None
+tc_map_image = None
 tc_map_annotations = {}
 tc_map_cbar = None
 tc_map_unused_var = None
+tc_heatmap_sensor_ids = []
+tc_heatmap_weights = None
+tc_heatmap_mask = None
+tc_heatmap_extent = (-1.05, 1.05, -1.05, 1.05)
+tc_sample_queue = deque(maxlen=6000)
+tc_sample_lock = threading.Lock()
+tc_tab_ref = None
+ir_tab_ref = None
 
 poll_in_progress = False
 poll_index = 0
@@ -1505,6 +1967,390 @@ ir_history = [
 ir_plot_axis = None
 ir_plot_lines = [None, None]
 ir_plot_canvas = None
+ir_target_line = None
+pid_plot_axis = None
+pid_plot_lines = [None, None]
+pid_status_var = None
+pid_detail_var = None
+pid_sensor_var = None
+pid_setpoint_var = None
+pid_kp_var = None
+pid_ki_var = None
+pid_kd_var = None
+pid_readback_var = None
+pid_duty_var = None
+pid_entry_widgets = []
+pid_history = deque(maxlen=PID_HISTORY_MAXLEN)
+
+
+# ============================================================
+# Export-only recording (independent of the existing plot buffers)
+# ============================================================
+export_temp_dir = None
+export_journals = {}
+export_last_values = {}
+export_recording_error = None
+export_busy = False
+export_wall_start = time.time()
+export_monotonic_start = time.monotonic()
+
+EXPORT_HEADERS = {
+    "values": ("timestamp", "section", "key", "value"),
+    "ir": ("timestamp", "elapsed_s", "sensor", "role", "port", "identity", "temperature_C"),
+    "tc": ("timestamp", "session_started_at", "elapsed_s", "device_time", "port")
+          + tuple(f"CH{i + 1:02d}_C" for i in range(TC_CHANNEL_COUNT)),
+    "pid": ("timestamp", "elapsed_s", "sensor", "pv_C", "target_C",
+            "kp", "ki", "kd", "freq_Hz", "dt_s", "error_C",
+            "p_term", "i_term", "d_term", "raw_duty_pct", "commanded_duty_pct"),
+}
+EXPORT_NOTES = {
+    "timestamps": "Local ISO 8601 time including UTC offset; elapsed_s uses the original acquisition clock.",
+    "history": "CSV contains samples/value changes recorded since this program started, including earlier TC sessions. Temporary records are removed when the program exits; use Save before closing.",
+    "graphs": "PNG trend images show the recent plot window; CSV retains the complete recorded history. Heatmap is the current interpolated estimate, not additional sensor measurements.",
+    "missing": "Blank TC numeric cells mean OPEN/missing/non-finite. A CSV with only a header means no samples were received.",
+    "power": "Current is the RCS setpoint (%); optical power is calculated using 3000 W rated maximum, not measured optical power.",
+    "elapsed": "Laser elapsed time is host time since EMON acknowledgement, not measured optical ON time.",
+}
+
+
+def _export_timestamp(monotonic_time=None):
+    if monotonic_time is None:
+        return datetime.now().astimezone().isoformat(timespec="milliseconds")
+    epoch = export_wall_start + monotonic_time - export_monotonic_start
+    return datetime.fromtimestamp(epoch).astimezone().isoformat(timespec="milliseconds")
+
+
+def _export_number(value):
+    if value is None:
+        return ""
+    try:
+        return float(value) if math.isfinite(float(value)) else ""
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _append_export_record(name, row):
+    global export_recording_error
+    if export_recording_error is not None:
+        return
+    try:
+        journal = export_journals.get(name)
+        if journal is not None:
+            journal["writer"].writerow(row)
+    except Exception as exc:
+        # A disk failure must not interrupt laser control or sensor acquisition.
+        export_recording_error = str(exc)
+        log(f"SAVE recording error: {exc}", level="ERROR")
+
+
+def _record_export_value(section, key, var):
+    value = var.get()
+    identity = (section, str(key))
+    if export_last_values.get(identity) == value:
+        return
+    export_last_values[identity] = value
+    _append_export_record("values", (_export_timestamp(), section, key, value))
+
+
+def initialize_export_recording():
+    global export_temp_dir, export_recording_error
+    try:
+        export_temp_dir = tempfile.TemporaryDirectory(prefix="raycus_export_")
+        for name, header in EXPORT_HEADERS.items():
+            path = Path(export_temp_dir.name) / f"{name}.csv"
+            handle = path.open("w", encoding="utf-8-sig", newline="")
+            writer = csv.writer(handle)
+            writer.writerow(header)
+            export_journals[name] = {"path": path, "handle": handle, "writer": writer}
+        connection_fields = {
+            "state": connection_var, "ip": ip_var, "port": port_var,
+            "transport": transport_var, "reads_ms": reads_ms_var,
+            "timeout_ms": timeout_ms_var, "local_address": local_port_var,
+            "polling": polling_info_var, "sta_rtt": sta_rtt_var,
+        }
+        for section, variables in (
+            ("readback", readback_vars), ("status", status_vars),
+            ("sta_bits", sta_bit_vars), ("connection", connection_fields),
+            ("tc_state", {"state": tc_status_var, "selected_port": tc_port_var}),
+        ):
+            for key, var in variables.items():
+                _record_export_value(section, key, var)
+                var.trace_add("write", lambda *_, s=section, k=key, v=var: _record_export_value(s, k, v))
+    except Exception as exc:
+        export_recording_error = str(exc)
+        log(f"SAVE recording unavailable: {exc}", level="ERROR")
+
+
+def close_export_recording():
+    for journal in export_journals.values():
+        try:
+            journal["handle"].close()
+        except Exception:
+            pass
+    if export_temp_dir is not None and not export_busy:
+        export_temp_dir.cleanup()
+
+
+def _capture_export_snapshot():
+    """Read Tk and live buffers only on the GUI thread; saving uses immutable copies."""
+    if export_recording_error is not None:
+        raise RuntimeError(f"저장용 기록 오류: {export_recording_error}")
+    boundaries = {}
+    for name, journal in export_journals.items():
+        journal["handle"].flush()
+        boundaries[name] = (str(journal["path"]), journal["path"].stat().st_size)
+    now = time.monotonic()
+    snapshot = {
+        "saved_at": _export_timestamp(),
+        "notes": dict(EXPORT_NOTES),
+        "connection": {
+            "state": connection_var.get(), "ip": ip_var.get(), "port": port_var.get(),
+            "transport": transport_var.get(), "reads_ms": reads_ms_var.get(),
+            "timeout_ms": timeout_ms_var.get(), "local_address": local_port_var.get(),
+            "polling": polling_info_var.get(), "sta_rtt": sta_rtt_var.get(),
+        },
+        "parameter_inputs": {"power_percent": power_set_var.get(), "frequency_Hz": freq_set_var.get(), "duty_percent": duty_set_var.get()},
+        "readback": {k: v.get() for k, v in readback_vars.items()},
+        "status": {k: v.get() for k, v in status_vars.items()},
+        "sta": {
+            "raw_word": latest_sta_value, "display_mode": sta_mode_var.get(),
+            "bits": {f"b{i:02d}": {"value": bit(latest_sta_value, i) if latest_sta_value is not None else None, "label": STA_BIT_LABELS[i]} for i in range(32)},
+        },
+        "ir": [{"sensor": i + 1, "role": IR_SENSOR_NAMES[i], "port": ir_port_vars[i].get(), "identity": ir_identity_vars[i].get(), "current": ir_current_vars[i].get()} for i in range(2)],
+        "pid": {
+            "state": pid_status_var.get(), "detail": pid_detail_var.get(),
+            "selected_sensor": pid_sensor_var.get(), "set_temperature_C": pid_setpoint_var.get(),
+            "kp": pid_kp_var.get(), "ki": pid_ki_var.get(), "kd": pid_kd_var.get(),
+            "selected_sensor_temperature": pid_readback_var.get(), "commanded_duty": pid_duty_var.get(),
+            "software_overshoot_margin_C": PID_OVERSHOOT_MARGIN_C,
+            "software_absolute_cutoff_C": PID_ABSOLUTE_CUTOFF_C,
+        },
+        "tc": {
+            "state": tc_status_var.get(), "selected_port": tc_port_var.get(),
+            "active_port": tc_active_port, "device_time": _export_number(tc_latest_device_time),
+            "channels": {f"CH{i + 1:02d}": {"current": tc_current_vars[i].get(), "temperature_C": _export_number(tc_latest_values[i])} for i in range(TC_CHANNEL_COUNT)},
+            "sensor_layout": {f"S{s}": {"channel": TC_SENSOR_MAPPING[s] + 1, "x": xy[0], "y": xy[1]} for s, xy in TC_SENSOR_COORDS.items()},
+            "heatmap_color_limits_C": list(tc_map_image.get_clim()) if tc_map_image is not None else [0.0, 500.0],
+        },
+    }
+    plots = {
+        "ir": [list(h) for h in ir_history], "tc": [list(h) for h in tc_history],
+        "pid": list(pid_history),
+        "ir_elapsed": max(IR_PLOT_WINDOW_SECONDS, now - ir_start_time),
+        "tc_elapsed": max(TC_PLOT_WINDOW_SECONDS, now - tc_start_monotonic),
+        "heatmap": _compute_tc_heatmap_fast().copy(),
+        "log": output.get("1.0", "end-1c") if output is not None else "",
+    }
+    return snapshot, boundaries, plots
+
+
+def _write_export_csv(path, header, rows):
+    with path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(header)
+        writer.writerows(rows)
+
+
+def _copy_export_prefix(source, size, destination):
+    # Copy exactly the save-time prefix; acquisition may keep appending meanwhile.
+    with open(source, "rb") as src, destination.open("wb") as dst:
+        remaining = size
+        while remaining:
+            chunk = src.read(min(1024 * 1024, remaining))
+            if not chunk:
+                raise IOError("저장용 기록 파일이 예상보다 짧습니다.")
+            dst.write(chunk)
+            remaining -= len(chunk)
+
+
+def _save_export_trend(path, histories, labels, right, window, title):
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    fig = Figure(figsize=(10, 6), dpi=150)
+    FigureCanvasAgg(fig)
+    axis = fig.add_subplot(111)
+    for history, label in zip(histories, labels):
+        points = [p for p in history if p[0] >= right - window]
+        if len(points) > TC_RENDER_MAX_POINTS:
+            points = points[::math.ceil(len(points) / TC_RENDER_MAX_POINTS)] + points[-1:]
+        axis.plot([p[0] for p in points], [p[1] for p in points], linewidth=1.0, label=label)
+    axis.set(title=title, xlabel="Elapsed Time (s)", ylabel="Temperature (°C)", xlim=(right - window, right))
+    axis.grid(True, alpha=0.3)
+    axis.legend(loc="upper left", fontsize=7, ncol=5 if len(labels) > 2 else 1)
+    fig.tight_layout()
+    fig.savefig(path)
+
+
+def _save_export_heatmap(folder, snapshot, grid):
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.patches import Circle
+    from matplotlib.patheffects import withStroke
+    fig = Figure(figsize=(7, 7), dpi=150)
+    FigureCanvasAgg(fig)
+    axis = fig.add_subplot(111)
+    axis.set(title="TC Wafer Heatmap / Sensor Positions", aspect="equal", xlim=(-1.08, 1.08), ylim=(-1.08, 1.08))
+    axis.axis("off")
+    axis.add_patch(Circle((0, 0), 1, fill=False, color="black"))
+    axis.add_patch(Circle((0, 0), 0.60, fill=False, color="gray", linestyle="--", alpha=0.45))
+    axis.add_patch(Circle((0, 0), 0.20, fill=False, color="gray", linestyle=":", alpha=0.45))
+    low, high = snapshot["tc"]["heatmap_color_limits_C"]
+    image = axis.imshow(grid, extent=tc_heatmap_extent, origin="lower", interpolation="bilinear", cmap="turbo", vmin=low, vmax=high)
+    layout_rows = []
+    for sensor, xy in TC_SENSOR_COORDS.items():
+        channel = TC_SENSOR_MAPPING[sensor] + 1
+        value = snapshot["tc"]["channels"][f"CH{channel:02d}"]["temperature_C"]
+        text = "OPEN" if value == "" else f"{value:.1f}°C"
+        axis.plot(*xy, "o", color="white", markeredgecolor="black", markersize=6)
+        axis.text(xy[0], xy[1] + 0.06, f"S{sensor}\nCH{channel:02d}\n{text}", ha="center", va="bottom", fontsize=8, color="white", path_effects=[withStroke(linewidth=1.5, foreground="black")])
+        layout_rows.append((sensor, channel, xy[0], xy[1], value))
+    fig.colorbar(image, ax=axis, fraction=0.046, pad=0.03).set_label("Temperature (°C)")
+    fig.savefig(folder / "tc_heatmap.png", bbox_inches="tight")
+    _write_export_csv(folder / "tc_sensor_layout.csv", ("sensor", "channel", "x_normalized", "y_normalized", "temperature_C"), layout_rows)
+    xs = np.linspace(tc_heatmap_extent[0], tc_heatmap_extent[1], grid.shape[1])
+    ys = np.linspace(tc_heatmap_extent[2], tc_heatmap_extent[3], grid.shape[0])
+    _write_export_csv(folder / "tc_heatmap_grid.csv", ("x_normalized", "y_normalized", "temperature_C"), ((x, y, _export_number(grid[j, i])) for j, y in enumerate(ys) for i, x in enumerate(xs)))
+
+
+def _flatten_export_values(value, prefix=""):
+    if isinstance(value, dict):
+        for key, item in value.items():
+            yield from _flatten_export_values(item, f"{prefix}.{key}" if prefix else str(key))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            yield from _flatten_export_values(item, f"{prefix}[{index}]")
+    else:
+        yield prefix, value
+
+
+def _write_export_bundle(folder, scope, key, snapshot, boundaries, plots):
+    selected = {"saved_at": snapshot["saved_at"], "notes": snapshot["notes"]}
+    sections = {
+        "all": ("connection", "parameter_inputs", "readback", "status", "sta", "ir", "pid", "tc"),
+        "readback": ("connection", "parameter_inputs", "readback", "sta"),
+        "status": ("status", "sta"), "sta": ("sta",),
+        "ir": ("ir", "pid"), "tc": ("tc",), "heatmap": ("tc",), "log": ("connection",),
+    }
+    for section in sections[scope]:
+        selected[section] = snapshot[section]
+    if key is not None:
+        if scope in ("readback", "status"):
+            selected = {"saved_at": snapshot["saved_at"], "notes": snapshot["notes"], scope: {key: snapshot[scope][key]}}
+        elif scope == "ir":
+            selected["ir"] = [snapshot["ir"][key]]
+        elif scope == "tc":
+            selected["tc"] = dict(snapshot["tc"], channels={f"CH{key + 1:02d}": snapshot["tc"]["channels"][f"CH{key + 1:02d}"]})
+        elif scope == "sta":
+            selected["sta"] = dict(snapshot["sta"], bits={f"b{key:02d}": snapshot["sta"]["bits"][f"b{key:02d}"]})
+    (folder / "snapshot.json").write_text(json.dumps(selected, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
+    _write_export_csv(folder / "current_values.csv", ("field", "value"), _flatten_export_values({k: v for k, v in selected.items() if k != "notes"}))
+
+    journals = []
+    if scope in ("all", "readback", "status", "sta"):
+        journals.append("values")
+    if scope in ("all", "ir"):
+        journals.append("ir")
+        journals.append("pid")
+    if scope in ("all", "tc"):
+        journals.append("tc")
+    for name in journals:
+        source, size = boundaries[name]
+        path = folder / f"{name}_history.csv"
+        _copy_export_prefix(source, size, path)
+        if scope == "all" or (name in ("ir", "pid", "tc") and key is None) or name == "pid":
+            continue
+        filtered = path.with_suffix(".filtered.csv")
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            if name == "values":
+                allowed = {"readback", "connection", "sta_bits"} if scope == "readback" else {"status", "sta_bits"} if scope == "status" else {"sta_bits"}
+                rows = (tuple(row[h] for h in EXPORT_HEADERS[name]) for row in reader if ((row["section"] in allowed or (scope == "sta" and row["section"] == "readback" and row["key"] == "sta")) and (key is None or (row["section"] == ("sta_bits" if scope == "sta" else scope) and row["key"] == str(key)))))
+                _write_export_csv(filtered, EXPORT_HEADERS[name], rows)
+            elif name == "ir":
+                _write_export_csv(filtered, EXPORT_HEADERS[name], (tuple(row[h] for h in EXPORT_HEADERS[name]) for row in reader if row["sensor"] == str(key + 1)))
+            else:
+                header = EXPORT_HEADERS[name][:5] + (f"CH{key + 1:02d}_C",)
+                _write_export_csv(filtered, header, (tuple(row[h] for h in header) for row in reader))
+        filtered.replace(path)
+
+    if scope in ("all", "ir"):
+        indices = range(2) if key is None else (key,)
+        _save_export_trend(folder / "ir_trend.png", [plots["ir"][i] for i in indices], [f"IR {i + 1} - {IR_SENSOR_NAMES[i]}" for i in indices], plots["ir_elapsed"], IR_PLOT_WINDOW_SECONDS, "Wafer / Outside-Wafer IR Temperature Trend")
+    if scope in ("all", "ir"):
+        fig = Figure(figsize=(10, 7), dpi=150)
+        top, bottom = fig.subplots(2, 1, sharex=True, gridspec_kw={"height_ratios": [2, 1]})
+        indices = range(2) if key is None else (key,)
+        for i in indices:
+            points = [p for p in plots["ir"][i] if p[0] >= plots["ir_elapsed"] - IR_PLOT_WINDOW_SECONDS]
+            top.plot([p[0] for p in points], [p[1] for p in points], label=IR_SENSOR_NAMES[i])
+        values = [p for p in plots["pid"] if p["elapsed"] >= plots["ir_elapsed"] - IR_PLOT_WINDOW_SECONDS]
+        if values:
+            top.plot([p["elapsed"] for p in values], [p["target"] for p in values], "--", label="PID set temperature")
+            bottom.plot([p["elapsed"] for p in values], [p["duty"] if p["duty"] is not None else float("nan") for p in values], label="PID duty")
+        top.set(ylabel="Temperature (°C)", title="IR Temperature / PID Control")
+        bottom.set(xlabel="Elapsed Time (s)", ylabel="Duty (%)", ylim=(0, 105))
+        top.legend(loc="upper left", fontsize=8)
+        bottom.legend(loc="upper left", fontsize=8)
+        top.grid(True, alpha=0.3)
+        bottom.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(folder / "ir_pid_trend.png")
+    if scope in ("all", "tc"):
+        indices = range(TC_CHANNEL_COUNT) if key is None else (key,)
+        _save_export_trend(folder / "tc_trend.png", [plots["tc"][i] for i in indices], [f"CH{i + 1:02d}" for i in indices], plots["tc_elapsed"], TC_PLOT_WINDOW_SECONDS, "Thermocouple Temperature Trend")
+    if scope in ("all", "heatmap") or (scope == "tc" and key is None):
+        _save_export_heatmap(folder, snapshot, plots["heatmap"])
+    if scope in ("all", "log"):
+        (folder / "command_error_log.txt").write_text(plots["log"], encoding="utf-8-sig")
+
+
+def save_monitor_data(scope="all", key=None):
+    global export_busy
+    if export_busy:
+        messagebox.showinfo("Save", "이전 저장 작업이 진행 중입니다.")
+        return
+    destination = filedialog.askdirectory(parent=root, title="저장할 폴더 선택")
+    if not destination:
+        return
+    try:
+        snapshot, boundaries, plots = _capture_export_snapshot()
+        suffix = f"_b{key:02d}" if scope == "sta" and key is not None else f"_{key + 1:02d}" if isinstance(key, int) else f"_{key}" if key is not None else ""
+        folder = Path(destination) / f"Raycus_{scope}{suffix}_{datetime.now():%Y%m%d_%H%M%S_%f}"
+        folder.mkdir()
+    except Exception as exc:
+        messagebox.showerror("Save", str(exc))
+        return
+    export_busy = True
+    log(f"SAVE started: {folder}")
+
+    def finish(error):
+        global export_busy
+        export_busy = False
+        if error is not None:
+            log(f"SAVE ERROR: {error} | partial folder: {folder}", level="ERROR")
+            messagebox.showerror("Save failed", f"저장 실패: {error}\n일부 파일만 생성되었을 수 있습니다.\n{folder}")
+        else:
+            log(f"SAVE completed: {folder}")
+            messagebox.showinfo("Saved", f"저장 완료\n{folder}")
+
+    def worker():
+        error = None
+        try:
+            _write_export_bundle(folder, scope, key, snapshot, boundaries, plots)
+        except Exception as exc:
+            error = str(exc)
+        try:
+            root.after(0, lambda: finish(error))
+        except (RuntimeError, tk.TclError):
+            pass
+
+    # Separate export figures and fixed journal boundaries keep acquisition running.
+    threading.Thread(target=worker, daemon=False).start()
+
+
+def add_export_button(parent, scope, key=None, text="Save", **grid_options):
+    button = ttk.Button(parent, text=text, command=lambda: save_monitor_data(scope, key))
+    if grid_options:
+        button.grid(**grid_options)
+    return button
 
 
 # ============================================================
@@ -1554,6 +2400,9 @@ def format_command_result(result):
 # Connection / polling UI callbacks
 # ============================================================
 def connect_from_ui():
+    if pid_supervisor.is_active() or pid_supervisor.emission_may_be_on:
+        messagebox.showwarning("PID", "PID 제어 중이거나 출력 OFF 미확인 상태입니다. 먼저 STOP 및 장비 확인을 하세요.")
+        return
     try:
         ip = ip_var.get().strip()
         port = int(port_var.get())
@@ -1612,6 +2461,13 @@ def finish_connect(local, verified, result, error):
 
 def disconnect_from_ui():
     global poll_in_progress, connected_since
+    if pid_supervisor.is_active():
+        pid_supervisor.request_stop("Disconnect requested")
+        log("PID stopping: wait for EMOFF acknowledgement before disconnect", "WARN")
+        return
+    if pid_supervisor.emission_may_be_on:
+        messagebox.showerror("PID FAULT", "PID EMOFF 응답이 확인되지 않았습니다. 연결 해제 전 하드웨어 출력 및 인터록을 확인하고 RESET 하세요.")
+        return
     raycus.close()
     poll_in_progress = False
     connected_since = None
@@ -1640,6 +2496,7 @@ def poll_tick():
         raycus.is_open
         and not poll_in_progress
         and not manual_command_pending.is_set()
+        and not pid_supervisor.is_active()
     ):
         command = POLL_COMMANDS[poll_index % len(POLL_COMMANDS)]
         poll_index = (poll_index + 1) % len(POLL_COMMANDS)
@@ -1725,6 +2582,15 @@ def finish_poll(command, result, error):
 # Command callbacks
 # ============================================================
 def run_command(func, *args):
+    if pid_supervisor.is_active() or pid_supervisor.emission_may_be_on:
+        if func is emission_off:
+            if pid_supervisor.is_active():
+                pid_supervisor.request_stop("Manual EMISSION OFF pressed")
+                return
+            # For FAULT: permit a direct manual EMOFF retry; then verify/reset STA.
+        else:
+            messagebox.showwarning("PID active", "PID 제어 중이거나 출력 OFF 미확인 상태입니다. EMOFF / RESET 후 수동 명령을 사용하세요.")
+            return
     # Give button-triggered commands priority over background readback.
     manual_command_pending.set()
 
@@ -1848,6 +2714,9 @@ def apply_duty():
 
 
 def apply_all_parameters():
+    if pid_supervisor.is_active() or pid_supervisor.emission_may_be_on:
+        messagebox.showwarning("PID active", "PID STOP 후 파라미터를 변경하세요.")
+        return
     try:
         values = _validate_parameter_inputs(require_all=True)
     except Exception as exc:
@@ -1923,6 +2792,8 @@ def update_decoded_status(sta):
 # ============================================================
 def update_ir_assignment(channel, port, sensor_meta=None):
     """Reflect current COM port + stable identity in GUI and plot legend."""
+    if port is None:
+        pid_supervisor.sensor_lost(channel)
     if root is None:
         return
 
@@ -1953,17 +2824,36 @@ def update_ir_assignment(channel, port, sensor_meta=None):
     root.after(0, apply_assignment)
 
 
+def swap_ir_histories_in_gui():
+    """Keep the displayed IR temperature traces tied to their physical sensors."""
+    pid_supervisor.request_stop("IR role mapping changed")
+    for channel in (0, 1):
+        pid_supervisor.sensor_lost(channel, "IR roles swapped")
+    if root is None:
+        return
+
+    def apply_swap():
+        ir_history[0], ir_history[1] = ir_history[1], ir_history[0]
+        ir_current_vars[0].set("--")
+        ir_current_vars[1].set("--")
+
+    root.after(0, apply_swap)
+
+
 def swap_ir_roles_from_ui():
+    pid_supervisor.request_stop("Manual IR role swap")
     if ir_manager_ref is not None:
         threading.Thread(target=ir_manager_ref.swap_roles, daemon=True).start()
 
 
 def rescan_ir_sensors_from_ui():
+    pid_supervisor.request_stop("IR sensor rescan")
     if ir_manager_ref is not None:
         threading.Thread(target=ir_manager_ref.request_rescan, daemon=True).start()
 
 
 def clear_ir_mapping_from_ui():
+    pid_supervisor.request_stop("IR mapping reset")
     if ir_manager_ref is None:
         return
     if messagebox.askyesno(
@@ -1973,21 +2863,243 @@ def clear_ir_mapping_from_ui():
         threading.Thread(target=ir_manager_ref.clear_mapping, daemon=True).start()
 
 
-def update_ir_temperature(channel, temperature):
+def update_ir_temperature(channel, temperature, crc_ok=True):
+    if crc_ok:
+        pid_supervisor.on_sample(channel, temperature)
+    else:
+        pid_supervisor.sensor_lost(channel, "IR Modbus CRC verification failed")
     if root is None:
         return
 
     def apply_value():
         if channel < len(ir_current_vars):
-            ir_current_vars[channel].set(f"{temperature:.1f} °C")
+            ir_current_vars[channel].set(f"{temperature:.1f} °C" if crc_ok
+                                         else f"{temperature:.1f} °C (CRC INVALID)")
+        if pid_sensor_var is not None and pid_sensor_var.get() == IR_SENSOR_NAMES[channel]:
+            pid_readback_var.set(f"{temperature:.1f} °C ({IR_SENSOR_NAMES[channel]})"
+                                 if crc_ok else "CRC INVALID (PID disabled)")
         elapsed = time.monotonic() - ir_start_time
         ir_history[channel].append((elapsed, temperature))
+        _append_export_record("ir", (
+            _export_timestamp(), elapsed, channel + 1, IR_SENSOR_NAMES[channel],
+            ir_port_vars[channel].get(), ir_identity_vars[channel].get(), _export_number(temperature),
+        ))
 
     root.after(0, apply_value)
 
 
+def _pid_settings_from_ui():
+    try:
+        sensor = pid_sensor_var.get()
+        channel = IR_SENSOR_NAMES.index(sensor)
+        values = {
+            "channel": channel, "target": float(pid_setpoint_var.get()),
+            "kp": float(pid_kp_var.get()), "ki": float(pid_ki_var.get()),
+            "kd": float(pid_kd_var.get()),
+        }
+    except (ValueError, TypeError) as exc:
+        raise ValueError("PID sensor / Set Temperature / P,I,D Gain을 확인하세요.") from exc
+    if any(not math.isfinite(v) for k, v in values.items() if k != "channel"):
+        raise ValueError("PID 설정에 NaN/Inf는 사용할 수 없습니다.")
+    if not PID_MIN_SETPOINT_C <= values["target"] <= PID_MAX_SETPOINT_C:
+        raise ValueError(f"Set Temperature: {PID_MIN_SETPOINT_C:g}~{PID_MAX_SETPOINT_C:g} °C")
+    if min(values["kp"], values["ki"], values["kd"]) < 0:
+        raise ValueError("P, I, D Gain은 0 이상이어야 합니다.")
+    if values["kp"] == values["ki"] == 0:
+        raise ValueError("P 또는 I Gain 중 하나는 0보다 커야 합니다.")
+    return values
+
+
+def pid_diagnostics_from_ui():
+    """Read-only PID preflight view. No laser configuration or emission command."""
+    if not raycus.is_open:
+        messagebox.showwarning("PID Diagnostics", "먼저 Raycus UDP에 연결하세요.", parent=root)
+        return
+    if pid_supervisor.is_active() or pid_supervisor.emission_may_be_on:
+        messagebox.showwarning("PID Diagnostics", "PID STOP/EMOFF 확인 후 진단하세요.", parent=root)
+        return
+    channel = IR_SENSOR_NAMES.index(pid_sensor_var.get())
+    with pid_supervisor.lock:
+        sample, timestamp = pid_supervisor.samples[channel]
+    age = (time.monotonic() - timestamp) if sample is not None else float("inf")
+    if sample is None:
+        log(f"[PID DIAG] Selected IR {IR_SENSOR_NAMES[channel]}: no CRC-verified value", "WARN")
+    else:
+        log(f"[PID DIAG] Selected IR {IR_SENSOR_NAMES[channel]}: "
+            f"{sample:.1f}°C, age={age:.2f}s "
+            f"({'FRESH' if age <= PID_SENSOR_MAX_AGE_S else 'STALE'})")
+
+    # Polling does not interleave with read-only diagnostics.
+    if manual_command_pending.is_set():
+        log("[PID DIAG] Another manual command is pending", "WARN")
+        return
+    manual_command_pending.set()
+
+    def worker():
+        try:
+            data = {}
+            for command in ("STA", "RCS", "RPRR", "RPW"):
+                try:
+                    result = raycus.command(command, timeout_ms=PID_COMMAND_TIMEOUT_MS)
+                    if not result.get("ok"):
+                        raise RuntimeError(result.get("result", "device rejected readback"))
+                    data[command] = response_number(result, command)
+                except Exception as exc:
+                    data[command] = f"READ FAILED: {exc}"
+            def display():
+                for command, value in data.items():
+                    log(f"[PID DIAG] {command}: {value}", "WARN" if isinstance(value, str) else "INFO")
+                sta = data["STA"]
+                if isinstance(sta, (int, float)):
+                    flags = int(round(sta))
+                    log(f"[PID DIAG] STA bits: READY={bit(flags, 18)}; "
+                        f"Laser enabled={bit(flags, 2)}; Alarm={bit(flags, 7)}; "
+                        f"Critical={bit(flags, 29)}; Gate={bit(flags, 16)}; "
+                        f"Modulation={bit(flags, 12)}; External control={bit(flags, 17)}")
+                if isinstance(data["RCS"], (int, float)) and data["RCS"] == 0:
+                    log("[PID DIAG] RCS=0%. Power input text is not applied until SET; PID cannot emit at 0%.", "WARN")
+                log("[PID DIAG] This test sent only read commands. No optical output was measured.")
+            if root is not None:
+                root.after(0, display)
+        finally:
+            manual_command_pending.clear()
+    threading.Thread(target=worker, name="PID-Diagnostics", daemon=True).start()
+
+
+def pid_start_from_ui():
+    try:
+        config = _pid_settings_from_ui()
+        channel = config["channel"]
+        if connection_var.get() == "Connecting...":
+            raise RuntimeError("Raycus 연결 확인 중입니다. 연결 완료 후 START 하세요.")
+        if not ir_port_vars[channel].get().upper().startswith("COM"):
+            raise RuntimeError("선택 IR 센서가 연결되지 않았습니다.")
+        if not messagebox.askyesno(
+            "PID START - Laser Emission",
+            f"{IR_SENSOR_NAMES[channel]} 센서가 정확하게 배치되었는지 직접 확인하세요.\n"
+            f"Set Temperature: {config['target']:g} °C\n"
+            f"P={config['kp']:g}  I={config['ki']:g}  D={config['kd']:g}\n\n"
+            "PID START는 실제 레이저 EMON을 전송합니다.\n"
+            "하드웨어 인터록 / 비상 정지 / 독립 과온 보호가 준비되었습니까?",
+            parent=root,
+        ):
+            return
+        pid_supervisor.start(config)
+    except Exception as exc:
+        messagebox.showerror("PID START", str(exc), parent=root)
+
+
+def pid_stop_from_ui():
+    # STOP must try EMOFF even when PID has not started / is already in FAULT.
+    if not pid_supervisor.request_stop("Operator pressed PID STOP"):
+        if raycus.is_open:
+            run_command(emission_off)
+        else:
+            log("PID STOP: Raycus socket is disconnected; physical output cannot be verified", "WARN")
+
+
+def pid_reset_fault_from_ui():
+    def worker():
+        try:
+            pid_supervisor.reset_fault()
+        except Exception as exc:
+            pid_supervisor._post_status("FAULT", f"RESET unsuccessful: {exc}")
+    threading.Thread(target=worker, name="PID-Reset-Fault", daemon=True).start()
+
+
+def pid_status_from_worker(state, details):
+    if pid_status_var is None:
+        return
+    pid_status_var.set(state)
+    pid_detail_var.set(details)
+    active = state in ("STARTING", "RUNNING", "STOPPING")
+    for widget in pid_entry_widgets:
+        try:
+            widget.configure(state="disabled" if active else
+                             "readonly" if isinstance(widget, ttk.Combobox) else "normal")
+        except tk.TclError:
+            pass
+    if state == "RUNNING":
+        log(f"[PID] RUNNING: {details}", "OK")
+    elif state in ("FAULT", "FAULT_STOPPED", "START_REJECTED"):
+        log(f"[PID] {state}: {details}", "ERROR")
+    elif state in ("STARTING", "STOPPING"):
+        log(f"[PID] {state}: {details}")
+    elif state == "IDLE":
+        log(f"[PID] {details}")
+
+
+def pid_record_from_worker(record):
+    pid_history.append(record)
+    if record["pv"] is not None:
+        pid_readback_var.set(f"{record['pv']:.1f} °C ({IR_SENSOR_NAMES[record['channel']]})")
+    pid_duty_var.set("UNKNOWN (OFF not confirmed)" if record["duty"] is None
+                     else f"{record['duty']:.2f} %")
+    _append_export_record("pid", (
+        record["timestamp"], record["elapsed"], IR_SENSOR_NAMES[record["channel"]],
+        _export_number(record["pv"]), _export_number(record["target"]),
+        _export_number(record["kp"]), _export_number(record["ki"]),
+        _export_number(record["kd"]), _export_number(record["frequency"]),
+        _export_number(record["dt"]), _export_number(record["error"]),
+        _export_number(record["p"]), _export_number(record["i"]),
+        _export_number(record["d"]), _export_number(record["raw_duty"]),
+        _export_number(record["duty"]),
+    ))
+
+
+def build_pid_panel(parent):
+    bar = ttk.LabelFrame(parent, text="IR Temperature PID Control", padding=7)
+    bar.pack(fill="x", padx=6, pady=(3, 3))
+    bar.columnconfigure(1, weight=1)
+    bar.columnconfigure(3, weight=1)
+    bar.columnconfigure(5, weight=1)
+    bar.columnconfigure(7, weight=1)
+
+    ttk.Label(bar, text="Control IR sensor").grid(row=0, column=0, sticky="w", padx=3, pady=4)
+    sensor = ttk.Combobox(bar, textvariable=pid_sensor_var, values=IR_SENSOR_NAMES,
+                          state="readonly", width=17)
+    sensor.grid(row=0, column=1, sticky="ew", padx=3)
+    ttk.Label(bar, text="Set Temperature (°C)").grid(row=0, column=2, sticky="w", padx=3)
+    target = ttk.Entry(bar, textvariable=pid_setpoint_var, width=10)
+    target.grid(row=0, column=3, sticky="ew", padx=3)
+    ttk.Label(bar, text="Measured PV").grid(row=0, column=4, sticky="w", padx=3)
+    ttk.Label(bar, textvariable=pid_readback_var, style="ReadbackValue.TLabel").grid(
+        row=0, column=5, columnspan=3, sticky="w", padx=3)
+
+    ttk.Label(bar, text="P-Gain (Kp)").grid(row=1, column=0, sticky="w", padx=3, pady=4)
+    kp = ttk.Entry(bar, textvariable=pid_kp_var, width=10)
+    kp.grid(row=1, column=1, sticky="ew", padx=3)
+    ttk.Label(bar, text="I-Gain (Ki)").grid(row=1, column=2, sticky="w", padx=3)
+    ki = ttk.Entry(bar, textvariable=pid_ki_var, width=10)
+    ki.grid(row=1, column=3, sticky="ew", padx=3)
+    ttk.Label(bar, text="D-Gain (Kd)").grid(row=1, column=4, sticky="w", padx=3)
+    kd = ttk.Entry(bar, textvariable=pid_kd_var, width=10)
+    kd.grid(row=1, column=5, sticky="ew", padx=3)
+    ttk.Label(bar, text="PID Duty").grid(row=1, column=6, sticky="w", padx=3)
+    ttk.Label(bar, textvariable=pid_duty_var, style="ReadbackValue.TLabel").grid(
+        row=1, column=7, sticky="w", padx=3)
+    pid_entry_widgets[:] = [sensor, target, kp, ki, kd]
+
+    buttons = ttk.Frame(bar)
+    buttons.grid(row=2, column=0, columnspan=8, sticky="ew", padx=3, pady=(6, 1))
+    ttk.Button(buttons, text="CHECK STATUS (NO OUTPUT)", command=pid_diagnostics_from_ui).pack(side="left", padx=(0, 6))
+    ttk.Button(buttons, text="PID START / EMON", command=pid_start_from_ui).pack(side="left", padx=(0, 6))
+    ttk.Button(buttons, text="PID STOP / EMOFF", command=pid_stop_from_ui).pack(side="left", padx=(0, 6))
+    ttk.Button(buttons, text="RESET FAULT (STA check)", command=pid_reset_fault_from_ui).pack(side="left", padx=(0, 12))
+    ttk.Label(buttons, text="Status:").pack(side="left")
+    ttk.Label(buttons, textvariable=pid_status_var, style="ReadbackValue.TLabel").pack(side="left", padx=(3, 10))
+    ttk.Label(buttons, textvariable=pid_detail_var, style="Note.TLabel").pack(side="left")
+    ttk.Label(bar, text="Software stop: selected IR timeout, STA error, PID/UDP failure or over-temperature. "
+                        "Not a safety-rated interlock.", style="Note.TLabel").grid(
+                            row=3, column=0, columnspan=8, sticky="w", padx=3, pady=(4, 1))
+
+
 def update_ir_plots():
     if root is None or ir_plot_axis is None or ir_plot_canvas is None:
+        return
+
+    if not _tab_is_visible(ir_tab_ref):
+        root.after(IR_PLOT_REFRESH_MS, update_ir_plots)
         return
 
     elapsed_now = time.monotonic() - ir_start_time
@@ -2013,6 +3125,31 @@ def update_ir_plots():
     x_right = max(IR_PLOT_WINDOW_SECONDS, elapsed_now)
     ir_plot_axis.set_xlim(x_right - IR_PLOT_WINDOW_SECONDS, x_right)
 
+    if ir_target_line is not None:
+        try:
+            target = float(pid_setpoint_var.get())
+            if math.isfinite(target):
+                ir_target_line.set_ydata([target, target])
+                visible_temperatures.append(target)
+        except (ValueError, TypeError):
+            pass
+
+    if pid_plot_axis is not None:
+        values = [r for r in pid_history if r["elapsed"] >= cutoff]
+        if values:
+            pid_plot_lines[0].set_data(
+                [r["elapsed"] for r in values],
+                [r["duty"] if r["duty"] is not None else math.nan for r in values],
+            )
+            pid_plot_lines[1].set_data(
+                [r["elapsed"] for r in values],
+                [r["raw_duty"] if r["raw_duty"] is not None else math.nan for r in values],
+            )
+        else:
+            pid_plot_lines[0].set_data([], [])
+            pid_plot_lines[1].set_data([], [])
+        pid_plot_axis.set_xlim(x_right - IR_PLOT_WINDOW_SECONDS, x_right)
+
     if visible_temperatures:
         temp_min = min(visible_temperatures)
         temp_max = max(visible_temperatures)
@@ -2024,7 +3161,7 @@ def update_ir_plots():
 
 
 def build_ir_plot(parent):
-    global ir_plot_axis, ir_plot_canvas
+    global ir_plot_axis, ir_plot_canvas, ir_target_line, pid_plot_axis
 
     identity_box = ttk.LabelFrame(parent, text="IR Sensor Auto Identity", padding=6)
     identity_box.pack(fill="x", padx=6, pady=(6, 2))
@@ -2049,6 +3186,7 @@ def build_ir_plot(parent):
     ttk.Button(button_bar, text="Rescan IR", command=rescan_ir_sensors_from_ui).pack(side="left", padx=(0, 5))
     ttk.Button(button_bar, text="Swap Wafer / Outside", command=swap_ir_roles_from_ui).pack(side="left", padx=5)
     ttk.Button(button_bar, text="Forget Mapping", command=clear_ir_mapping_from_ui).pack(side="left", padx=5)
+    add_export_button(button_bar, "ir", text="Save IR + PID").pack(side="left", padx=(16, 5))
 
     ttk.Label(
         identity_box,
@@ -2059,26 +3197,42 @@ def build_ir_plot(parent):
         style="Note.TLabel",
     ).grid(row=3, column=0, columnspan=4, sticky="w", padx=4, pady=(3, 1))
 
+    build_pid_panel(parent)
+
     frame = ttk.Frame(parent, padding=6)
     frame.pack(fill="both", expand=True)
 
     figure = Figure(figsize=(8.0, 5.5), dpi=100)
-    axis = figure.add_subplot(111)
+    axis, duty_axis = figure.subplots(2, 1, sharex=True, gridspec_kw={"height_ratios": [2, 1]})
     line1, = axis.plot([], [], linewidth=1.5, label=f"IR Sensor 1 - {IR_SENSOR_NAMES[0]} (AUTO SEARCH)")
     line2, = axis.plot([], [], linewidth=1.5, label=f"IR Sensor 2 - {IR_SENSOR_NAMES[1]} (AUTO SEARCH)")
-    axis.set_title("Wafer / Outside-Wafer IR Temperature Trend")
-    axis.set_xlabel("Elapsed Time (s)")
+    target_line = axis.axhline(200.0, color="#c43d3d", linestyle="--", linewidth=1.4,
+                               label="PID Set Temperature")
+    axis.set_title("Wafer / Outside-Wafer IR Temperature Trend + PID")
+    duty_axis.set_xlabel("Elapsed Time (s)")
     axis.set_ylabel("Temperature (°C)")
     axis.grid(True, alpha=0.3)
     axis.legend(loc="upper left")
     axis.set_xlim(0, IR_PLOT_WINDOW_SECONDS)
-    axis.set_ylim(20, 40)
+    axis.set_ylim(20, 250)
+    commanded, = duty_axis.plot([], [], color="#27845d", lw=1.6, label="Commanded PID Duty (%)")
+    calculated, = duty_axis.plot([], [], color="#8b7c96", linestyle="--", lw=1.0,
+                                  label="Calculated Raw PID Duty (%)")
+    duty_axis.set_ylabel("Duty (%)")
+    duty_axis.set_xlim(0, IR_PLOT_WINDOW_SECONDS)
+    duty_axis.set_ylim(0, 105)
+    duty_axis.grid(True, alpha=0.3)
+    duty_axis.legend(loc="upper left", fontsize=8)
     figure.tight_layout()
 
     canvas = FigureCanvasTkAgg(figure, master=frame)
     canvas.get_tk_widget().pack(fill="both", expand=True)
 
     ir_plot_axis = axis
+    ir_target_line = target_line
+    pid_plot_axis = duty_axis
+    pid_plot_lines[0] = commanded
+    pid_plot_lines[1] = calculated
     ir_plot_lines[0] = line1
     ir_plot_lines[1] = line2
     ir_plot_canvas = canvas
@@ -2119,30 +3273,56 @@ def update_tc_state(state):
 
 
 def update_tc_data(temps, device_ts):
+    """Receive TC packets from worker thread without touching Tk on every packet.
+
+    Raw samples are queued and the Tk thread drains them in batches. This preserves
+    the measurement history while preventing hundreds of Tk callbacks per second.
+    """
+    if len(temps) != TC_CHANNEL_COUNT:
+        return
+    sample = (time.monotonic(), list(temps), device_ts)
+    with tc_sample_lock:
+        tc_sample_queue.append(sample)
+
+
+def process_tc_sample_queue():
+    """Batch pending TC packets and update Tk labels only once per GUI tick."""
+    global tc_latest_values, tc_latest_device_time
+
     if root is None:
         return
 
-    def apply():
-        global tc_latest_values, tc_latest_device_time
+    pending = []
+    with tc_sample_lock:
+        while tc_sample_queue:
+            pending.append(tc_sample_queue.popleft())
 
-        if len(temps) != TC_CHANNEL_COUNT:
-            return
-
-        tc_latest_values = list(temps)
-        tc_latest_device_time = device_ts
-        elapsed = time.monotonic() - tc_start_monotonic
-
-        for idx, value in enumerate(temps):
-            if idx < len(tc_current_vars):
-                if math.isnan(value):
-                    tc_current_vars[idx].set("OPEN")
-                else:
-                    tc_current_vars[idx].set(f"{value:.1f} °C")
+    if pending:
+        for sample_time, temps, device_ts in pending:
+            elapsed = max(0.0, sample_time - tc_start_monotonic)
+            _append_export_record("tc", (
+                _export_timestamp(sample_time), _export_timestamp(tc_start_monotonic),
+                elapsed, _export_number(device_ts), tc_active_port or tc_port_var.get(),
+                *(_export_number(value) for value in temps),
+            ))
+            for idx, value in enumerate(temps):
+                if value is not None and not math.isnan(value):
                     tc_history[idx].append((elapsed, value))
 
-        update_tc_heatmap()
+        _, latest_temps, latest_device_ts = pending[-1]
+        tc_latest_values = list(latest_temps)
+        tc_latest_device_time = latest_device_ts
 
-    root.after(0, apply)
+        # Tk StringVars are intentionally updated once per batch, not per serial packet.
+        for idx, value in enumerate(latest_temps):
+            if idx >= len(tc_current_vars):
+                continue
+            if value is None or math.isnan(value):
+                tc_current_vars[idx].set('OPEN')
+            else:
+                tc_current_vars[idx].set(f'{value:.1f} °C')
+
+    root.after(TC_DATA_PROCESS_MS, process_tc_sample_queue)
 
 
 def start_tc_from_ui():
@@ -2164,6 +3344,8 @@ def start_tc_from_ui():
 
     tc_active_port = port
     tc_start_monotonic = time.monotonic()
+    with tc_sample_lock:
+        tc_sample_queue.clear()
     for history in tc_history:
         history.clear()
     for var in tc_current_vars:
@@ -2189,13 +3371,28 @@ def stop_tc_from_ui():
         tc_status_var.set("STOPPED")
 
 
+def _tab_is_visible(tab_widget):
+    if tab_widget is None:
+        return True
+    try:
+        return bool(tab_widget.winfo_ismapped())
+    except Exception:
+        return True
+
+
 def update_tc_plot():
     if root is None or tc_plot_axis is None or tc_plot_canvas is None:
         return
 
+    # Hidden Matplotlib tabs are not redrawn. Data acquisition/history continues.
+    if not _tab_is_visible(tc_tab_ref):
+        root.after(TC_PLOT_REFRESH_MS, update_tc_plot)
+        return
+
     elapsed_now = time.monotonic() - tc_start_monotonic
     cutoff = max(0.0, elapsed_now - TC_PLOT_WINDOW_SECONDS)
-    visible = []
+    visible_min = None
+    visible_max = None
 
     for idx in range(TC_CHANNEL_COUNT):
         history = tc_history[idx]
@@ -2205,124 +3402,139 @@ def update_tc_plot():
         if idx >= len(tc_plot_lines):
             continue
 
-        if history:
-            xs = [sample[0] for sample in history]
-            ys = [sample[1] for sample in history]
-            tc_plot_lines[idx].set_data(xs, ys)
-            visible.extend(ys)
-        else:
+        if not history:
             tc_plot_lines[idx].set_data([], [])
+            continue
+
+        # Rendering all raw points from 20 channels is expensive. Keep every sample
+        # in history, but draw at most TC_RENDER_MAX_POINTS per channel.
+        n = len(history)
+        step = max(1, math.ceil(n / TC_RENDER_MAX_POINTS))
+        samples = list(history)[::step]
+        if samples[-1] != history[-1]:
+            samples.append(history[-1])
+
+        xs = [sample[0] for sample in samples]
+        ys = [sample[1] for sample in samples]
+        tc_plot_lines[idx].set_data(xs, ys)
+
+        local_min = min(ys)
+        local_max = max(ys)
+        visible_min = local_min if visible_min is None else min(visible_min, local_min)
+        visible_max = local_max if visible_max is None else max(visible_max, local_max)
 
     x_right = max(TC_PLOT_WINDOW_SECONDS, elapsed_now)
     tc_plot_axis.set_xlim(x_right - TC_PLOT_WINDOW_SECONDS, x_right)
 
-    if visible:
-        y_min = min(visible)
-        y_max = max(visible)
-        span = y_max - y_min
+    if visible_min is not None and visible_max is not None:
+        span = visible_max - visible_min
         pad = max(2.0, span * 0.10)
-        tc_plot_axis.set_ylim(y_min - pad, y_max + pad)
+        tc_plot_axis.set_ylim(visible_min - pad, visible_max + pad)
 
-    update_tc_heatmap()
     tc_plot_canvas.draw_idle()
     root.after(TC_PLOT_REFRESH_MS, update_tc_plot)
 
 
-def _compute_tc_heatmap_grid():
-    xs = np.linspace(-1.05, 1.05, TC_HEATMAP_GRID)
-    ys = np.linspace(-1.05, 1.05, TC_HEATMAP_GRID)
-    grid_x, grid_y = np.meshgrid(xs, ys)
+def initialize_tc_heatmap_cache():
+    """Precompute all geometry-dependent interpolation weights once."""
+    global tc_heatmap_sensor_ids, tc_heatmap_weights, tc_heatmap_mask
 
-    points = []
-    values = []
+    xs = np.linspace(tc_heatmap_extent[0], tc_heatmap_extent[1], TC_HEATMAP_GRID)
+    ys = np.linspace(tc_heatmap_extent[2], tc_heatmap_extent[3], TC_HEATMAP_GRID)
+    grid_x, grid_y = np.meshgrid(xs, ys)
+    tc_heatmap_mask = (grid_x ** 2 + grid_y ** 2) > 1.0
+
+    sensor_ids = []
+    weights = []
     for sensor_id, (x, y) in TC_SENSOR_COORDS.items():
         ch_index = TC_SENSOR_MAPPING.get(sensor_id)
-        if ch_index is None or ch_index >= len(tc_latest_values):
+        if ch_index is None:
             continue
-        value = tc_latest_values[ch_index]
-        if value is None or math.isnan(value):
-            continue
-        points.append((x, y))
-        values.append(float(value))
+        distance2 = (grid_x - x) ** 2 + (grid_y - y) ** 2
+        weight = 1.0 / np.maximum(distance2, 1e-6)
+        weights.append(weight.astype(np.float32))
+        sensor_ids.append(sensor_id)
 
-    if not points:
-        return grid_x, grid_y, np.full_like(grid_x, np.nan, dtype=float)
+    tc_heatmap_sensor_ids = sensor_ids
+    tc_heatmap_weights = np.stack(weights, axis=0) if weights else None
 
-    pts = np.array(points, dtype=float)
-    vals = np.array(values, dtype=float)
-    px = pts[:, 0][:, None, None]
-    py = pts[:, 1][:, None, None]
-    distances = np.sqrt((grid_x[None, :, :] - px) ** 2 + (grid_y[None, :, :] - py) ** 2)
-    distances = np.maximum(distances, 1e-6)
-    weights = 1.0 / (distances ** 2)
-    grid_z = np.sum(weights * vals[:, None, None], axis=0) / np.sum(weights, axis=0)
-    mask = (grid_x ** 2 + grid_y ** 2) > (1.0 ** 2)
-    grid_z = np.where(mask, np.nan, grid_z)
-    return grid_x, grid_y, grid_z
+
+def _compute_tc_heatmap_fast():
+    if tc_heatmap_weights is None:
+        initialize_tc_heatmap_cache()
+    if tc_heatmap_weights is None:
+        return np.full((TC_HEATMAP_GRID, TC_HEATMAP_GRID), np.nan, dtype=float)
+
+    values = []
+    valid = []
+    for i, sensor_id in enumerate(tc_heatmap_sensor_ids):
+        ch_index = TC_SENSOR_MAPPING.get(sensor_id)
+        value = tc_latest_values[ch_index] if ch_index is not None else math.nan
+        if value is not None and not math.isnan(value):
+            valid.append(i)
+            values.append(float(value))
+
+    if not valid:
+        return np.full((TC_HEATMAP_GRID, TC_HEATMAP_GRID), np.nan, dtype=float)
+
+    w = tc_heatmap_weights[valid]
+    vals = np.asarray(values, dtype=np.float32)[:, None, None]
+    denom = np.sum(w, axis=0)
+    grid_z = np.sum(w * vals, axis=0) / np.maximum(denom, 1e-12)
+    grid_z = grid_z.astype(float, copy=False)
+    grid_z[tc_heatmap_mask] = np.nan
+    return grid_z
 
 
 def update_tc_heatmap():
-    global tc_map_mesh
-    if tc_map_axis is None or tc_map_canvas is None:
+    if root is None or tc_map_image is None or tc_map_canvas is None:
         return
 
-    grid_x, grid_y, grid_z = _compute_tc_heatmap_grid()
+    if not _tab_is_visible(tc_tab_ref):
+        root.after(TC_HEATMAP_REFRESH_MS, update_tc_heatmap)
+        return
 
-    if tc_map_mesh is not None:
-        try:
-            tc_map_mesh.remove()
-        except Exception:
-            pass
-        tc_map_mesh = None
+    grid_z = _compute_tc_heatmap_fast()
+    tc_map_image.set_data(grid_z)
 
-    finite = grid_z[np.isfinite(grid_z)]
-    if finite.size:
-        vmin = float(np.min(finite))
-        vmax = float(np.max(finite))
-        if abs(vmax - vmin) < 1e-6:
-            vmax = vmin + 1.0
-    else:
-        vmin, vmax = 20.0, 100.0
+    # Fixed heatmap color scale: 0~500 °C.
+    # No dynamic colorbar rescaling -> lighter GUI rendering.
+    tc_map_image.set_clim(0.0, 400.0)
 
-    tc_map_mesh = tc_map_axis.pcolormesh(
-        grid_x, grid_y, grid_z,
-        shading='gouraud',
-        cmap='turbo',
-        vmin=vmin, vmax=vmax,
-    )
-
-    for sensor_id, (x, y) in TC_SENSOR_COORDS.items():
+    for sensor_id in TC_SENSOR_COORDS:
         ch_index = TC_SENSOR_MAPPING.get(sensor_id)
         value = math.nan
         if ch_index is not None and ch_index < len(tc_latest_values):
             value = tc_latest_values[ch_index]
         txt = tc_map_annotations.get(sensor_id)
-        if txt is not None:
-            if value is None or math.isnan(value):
-                txt.set_text(f'S{sensor_id}\nCH{ch_index+1 if ch_index is not None else 0:02d}\nOPEN')
-            else:
-                txt.set_text(f'S{sensor_id}\nCH{ch_index+1 if ch_index is not None else 0:02d}\n{value:.1f}°C')
-
-    if tc_map_cbar is not None:
-        tc_map_cbar.update_normal(tc_map_mesh)
-
-    unused_channels = [idx + 1 for idx in range(TC_CHANNEL_COUNT) if idx not in set(TC_SENSOR_MAPPING.values())]
-    pieces = []
-    for ch in unused_channels:
-        val = tc_latest_values[ch - 1]
-        if val is None or math.isnan(val):
-            pieces.append(f'CH{ch:02d}=OPEN')
+        if txt is None:
+            continue
+        ch_text = ch_index + 1 if ch_index is not None else 0
+        if value is None or math.isnan(value):
+            txt.set_text(f'S{sensor_id}\nCH{ch_text:02d}\nOPEN')
         else:
-            pieces.append(f'CH{ch:02d}={val:.1f}°C')
+            txt.set_text(f'S{sensor_id}\nCH{ch_text:02d}\n{value:.1f}°C')
+
+    mapped_channels = set(TC_SENSOR_MAPPING.values())
+    pieces = []
+    for idx in range(TC_CHANNEL_COUNT):
+        if idx in mapped_channels:
+            continue
+        value = tc_latest_values[idx]
+        if value is None or math.isnan(value):
+            pieces.append(f'CH{idx + 1:02d}=OPEN')
+        else:
+            pieces.append(f'CH{idx + 1:02d}={value:.1f}°C')
     if tc_map_unused_var is not None:
         tc_map_unused_var.set('Unused / off-wafer: ' + (' | '.join(pieces) if pieces else '-'))
 
     tc_map_canvas.draw_idle()
+    root.after(TC_HEATMAP_REFRESH_MS, update_tc_heatmap)
 
 
 def build_tc_plot(parent):
     global tc_plot_axis, tc_plot_lines, tc_plot_canvas, tc_port_combo
-    global tc_map_axis, tc_map_canvas, tc_map_annotations, tc_map_cbar, tc_map_unused_var
+    global tc_map_axis, tc_map_canvas, tc_map_image, tc_map_annotations, tc_map_cbar, tc_map_unused_var
 
     controls = ttk.LabelFrame(parent, text="20CH Thermocouple Acquisition", padding=8)
     controls.pack(fill="x", padx=6, pady=(6, 2))
@@ -2357,6 +3569,11 @@ def build_tc_plot(parent):
         text="115200 baud / start='s' / stop='q' / tick + CH1~CH20",
         style="Note.TLabel",
     ).pack(side="right", padx=4)
+
+    save_bar = ttk.Frame(parent)
+    save_bar.pack(fill="x", padx=12, pady=(2, 0))
+    add_export_button(save_bar, "tc", text="Save TC").pack(side="left", padx=(0, 6))
+    add_export_button(save_bar, "heatmap", text="Save Heatmap").pack(side="left", padx=6)
 
     values = ttk.LabelFrame(parent, text="Live TC Values", padding=6)
     values.pack(fill="x", padx=6, pady=4)
@@ -2412,8 +3629,9 @@ def build_tc_plot(parent):
     canvas.get_tk_widget().pack(fill="both", expand=True)
 
     map_fig = Figure(figsize=(5.2, 5.0), dpi=100)
+    map_fig.subplots_adjust(top=0.86)
     map_axis = map_fig.add_subplot(111)
-    map_axis.set_title('TC Wafer Heatmap / Sensor Positions')
+    map_axis.set_title('TC Wafer Heatmap / Sensor Positions', y=1.08, pad=12)
     map_axis.set_aspect('equal')
     map_axis.set_xlim(-1.08, 1.08)
     map_axis.set_ylim(-1.08, 1.08)
@@ -2442,10 +3660,21 @@ def build_tc_plot(parent):
     except Exception:
         pass
 
-    dummy = np.linspace(20.0, 100.0, 10).reshape(2, 5)
-    img = map_axis.imshow(dummy, extent=[-1, -0.99, -1, -0.99], cmap='turbo', visible=False)
+    initialize_tc_heatmap_cache()
+    initial_grid = np.full((TC_HEATMAP_GRID, TC_HEATMAP_GRID), np.nan, dtype=float)
+    img = map_axis.imshow(
+        initial_grid,
+        extent=tc_heatmap_extent,
+        origin='lower',
+        interpolation='bilinear',
+        cmap='turbo',
+        vmin=0.0,
+        vmax=500.0,
+        zorder=0,
+    )
     cbar = map_fig.colorbar(img, ax=map_axis, fraction=0.046, pad=0.03)
     cbar.set_label('Temperature (°C)')
+    cbar.set_ticks([0, 100, 200, 300, 400, 500])
 
     unused_var = tk.StringVar(parent, 'Unused / off-wafer: CH11=OPEN | CH18=OPEN | CH19=OPEN')
     ttk.Label(map_host, textvariable=unused_var, style='Note.TLabel', anchor='w').pack(fill='x', padx=2, pady=(0, 4))
@@ -2458,6 +3687,7 @@ def build_tc_plot(parent):
     tc_plot_canvas = canvas
     tc_map_axis = map_axis
     tc_map_canvas = map_canvas
+    tc_map_image = img
     tc_map_cbar = cbar
     tc_map_unused_var = unused_var
 
@@ -2642,9 +3872,12 @@ def add_readback_row(parent, row, label, key, note):
 
 
 def build_readback_status(parent):
-    ttk.Label(parent, text="03  READBACK & STATUS", style="Section.TLabel").pack(
-        anchor="w", pady=(0, 2)
+    title_bar = ttk.Frame(parent)
+    title_bar.pack(fill="x")
+    ttk.Label(title_bar, text="03  READBACK & STATUS", style="Section.TLabel").pack(
+        side="left", anchor="w", pady=(0, 2)
     )
+    add_export_button(title_bar, "readback", text="Save Readback").pack(side="right", pady=(0, 2))
     outer = ttk.Frame(parent, relief="groove", borderwidth=1, padding=4)
     outer.pack(fill="both", expand=True)
 
@@ -2732,12 +3965,16 @@ def build_status_decode_tab(parent):
         ttk.Label(frame, textvariable=status_vars[key], style="ReadbackValue.TLabel").grid(
             row=row, column=1, sticky="w", pady=4
         )
+    add_export_button(frame, "status", text="Save Decode").grid(row=len(fields), column=0, columnspan=2, sticky="w", pady=(16, 0))
 
 
 def build_log_section(parent):
-    ttk.Label(parent, text="Command / error log", style="Section.TLabel").pack(
-        anchor="w", padx=12, pady=(4, 2)
+    title_bar = ttk.Frame(parent)
+    title_bar.pack(fill="x", padx=12, pady=(4, 2))
+    ttk.Label(title_bar, text="Command / error log", style="Section.TLabel").pack(
+        side="left", anchor="w"
     )
+    add_export_button(title_bar, "log", text="Save Log").pack(side="right")
     frame = ttk.Frame(parent, relief="groove", borderwidth=1)
     frame.pack(fill="both", padx=12, pady=(0, 10))
 
@@ -2768,6 +4005,7 @@ def build_log_section(parent):
 # Main GUI
 # ============================================================
 def build_gui():
+    global tc_tab_ref, ir_tab_ref
     global root
     global ip_var, port_var, transport_var, reads_ms_var, timeout_ms_var
     global connection_var, polling_info_var, sta_rtt_var, local_port_var
@@ -2775,6 +4013,8 @@ def build_gui():
     global power_set_var, freq_set_var, duty_set_var
     global readback_vars, status_vars, sta_bit_vars, sta_mode_var, ir_current_vars, ir_port_vars, ir_identity_vars
     global tc_port_var, tc_status_var, tc_current_vars
+    global pid_sensor_var, pid_setpoint_var, pid_kp_var, pid_ki_var, pid_kd_var
+    global pid_readback_var, pid_duty_var, pid_status_var, pid_detail_var
 
     root = tk.Tk()
     root.title("Raycus Laser Control / Monitor - UDP")
@@ -2835,6 +4075,16 @@ def build_gui():
     ir_port_vars = [tk.StringVar(root, "AUTO SEARCH"), tk.StringVar(root, "AUTO SEARCH")]
     ir_identity_vars = [tk.StringVar(root, "Searching..."), tk.StringVar(root, "Searching...")]
 
+    pid_sensor_var = tk.StringVar(root, IR_SENSOR_NAMES[0])
+    pid_setpoint_var = tk.StringVar(root, "200")
+    pid_kp_var = tk.StringVar(root, "3.0")
+    pid_ki_var = tk.StringVar(root, "0.3")
+    pid_kd_var = tk.StringVar(root, "0.1")
+    pid_readback_var = tk.StringVar(root, "--")
+    pid_duty_var = tk.StringVar(root, "--")
+    pid_status_var = tk.StringVar(root, "IDLE")
+    pid_detail_var = tk.StringVar(root, "Ready to configure")
+
     tc_port_var = tk.StringVar(root, TC_DEFAULT_PORT)
     tc_status_var = tk.StringVar(root, "STOPPED")
     tc_current_vars = [tk.StringVar(root, "--") for _ in range(TC_CHANNEL_COUNT)]
@@ -2851,6 +4101,10 @@ def build_gui():
 
     build_control_panel(control_host)
 
+    save_bar = ttk.Frame(monitor_host)
+    save_bar.pack(fill="x", pady=(0, 4))
+    add_export_button(save_bar, "all", text="Save All").pack(side="right")
+
     notebook = ttk.Notebook(monitor_host)
     notebook.pack(fill="both", expand=True)
 
@@ -2858,6 +4112,8 @@ def build_gui():
     ir_tab = ttk.Frame(notebook)
     tc_tab = ttk.Frame(notebook)
     decoded_tab = ttk.Frame(notebook)
+    ir_tab_ref = ir_tab
+    tc_tab_ref = tc_tab
     notebook.add(readback_tab, text="Readback & Status")
     notebook.add(ir_tab, text="Wafer IR Trend")
     notebook.add(tc_tab, text="TC 20CH")
@@ -2870,6 +4126,7 @@ def build_gui():
 
     build_log_section(root)
     update_polling_info()
+    initialize_export_recording()
 
 
 # ============================================================
@@ -2887,20 +4144,37 @@ def main():
         temp_callback=update_ir_temperature,
         log_callback=log_from_worker,
         assignment_callback=update_ir_assignment,
+        role_swap_callback=swap_ir_histories_in_gui,
     )
     ir_manager_ref = ir_manager
     root.after(450, ir_manager.start)
 
     def on_close():
+        pid_supervisor.close()  # attempt EMOFF before closing UDP socket
+        off_confirmed = not pid_supervisor.emission_may_be_on
+        if raycus.is_open:
+            try:
+                result = raycus.command("EMOFF", timeout_ms=PID_COMMAND_TIMEOUT_MS)
+                if not result.get("ok"):
+                    raise RuntimeError(result.get("result", "EMOFF rejected"))
+                off_confirmed = True
+            except Exception as exc:
+                off_confirmed = False
+                log(f"Exit EMOFF not acknowledged: {exc}", "ERROR")
+        if not off_confirmed:
+            messagebox.showerror("Critical: EMOFF unverified", "출력 OFF 응답을 확인하지 못했습니다. 장비의 하드웨어 비상정지와 인터록을 직접 확인하세요.", parent=root)
         raycus.close()
         stop_tc_from_ui()
         ir_manager.stop()
+        close_export_recording()
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", on_close)
+    root.after(50, process_tc_sample_queue)
     root.after(100, update_fast_ui)
     root.after(200, update_ir_plots)
     root.after(250, update_tc_plot)
+    root.after(300, update_tc_heatmap)
     root.after(250, poll_tick)
     root.mainloop()
 
